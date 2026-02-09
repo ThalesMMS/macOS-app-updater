@@ -489,28 +489,11 @@ update_mas() {
     log "mas: 'account' subcommand not supported by this mas version; skipping diagnostic."
   fi
 
-  run_cmd "mas: outdated (pre-update; diagnostic)" mas outdated || true
+  run_cmd "mas: outdated (check for available updates)" mas outdated || true
 
-  if run_cmd "mas: update (updates all App Store apps to latest available)" mas update; then
-    STATUS_MAS="OK"
-  else
-    log "mas: update failed. Attempting 'mas reset' and retrying once..."
-    if mas_has_subcommand "reset"; then
-      run_cmd "mas: reset (restart App Store services / clear cached downloads)" mas reset || true
-      if run_cmd "mas: update (retry after reset)" mas update; then
-        STATUS_MAS="OK"
-      else
-        STATUS_MAS="FAILED"
-        log "mas: still failing. Common causes: App Store sign-in/2FA/terms prompt pending, or App Store stuck."
-        log "mas: suggested manual fix: open App Store.app, confirm sign-in and any prompts, then rerun."
-      fi
-    else
-      STATUS_MAS="FAILED"
-      log "mas: 'reset' subcommand not available; cannot auto-recover."
-    fi
-  fi
-
-  run_cmd "mas: outdated (post-update; diagnostic)" mas outdated || true
+  # Skip actual updates - only checking for outdated apps
+  log "mas: skipping updates (check-only mode)"
+  STATUS_MAS="OK"
 }
 
 ########################################
