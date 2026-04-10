@@ -28,24 +28,21 @@ jobs:
       - name: Build release artifacts
         run: |
           set -euo pipefail
-          mkdir -p dist/package
-          chmod +x update-all.sh
-          cp update-all.sh README.md LICENSE dist/package/
-          tar -czf "dist/${APP_NAME}-${TAG_NAME}.tar.gz" -C dist/package update-all.sh README.md LICENSE
-          (
-            cd dist/package
-            zip -q "../${APP_NAME}-${TAG_NAME}.zip" update-all.sh README.md LICENSE
-          )
+          mkdir -p dist
+          git archive --format=tar --prefix="${APP_NAME}-${TAG_NAME}/" -o "dist/${APP_NAME}-${TAG_NAME}.tar" "${TAG_NAME}"
+          gzip -f "dist/${APP_NAME}-${TAG_NAME}.tar"
+          git archive --format=zip --prefix="${APP_NAME}-${TAG_NAME}/" -o "dist/${APP_NAME}-${TAG_NAME}.zip" "${TAG_NAME}"
           (
             cd dist
             shasum -a 256 "${APP_NAME}-${TAG_NAME}.tar.gz" "${APP_NAME}-${TAG_NAME}.zip" > "${APP_NAME}-${TAG_NAME}-SHA256SUMS.txt"
           )
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
             dist/*.zip
