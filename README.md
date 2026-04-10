@@ -38,6 +38,15 @@ brew install mas
 brew install node
 ```
 
+## Installation
+
+```bash
+git clone https://github.com/ThalesMMS/macOS-app-updater.git
+cd macOS-app-updater
+chmod +x update-all.sh
+./update-all.sh --help
+```
+
 ## Usage
 
 ```bash
@@ -87,6 +96,19 @@ brew install node
 ## Logging
 
 All operations are logged to `~/Library/Logs/update-all/update-all_YYYY-MM-DD_HH-MM-SS.log`
+
+## Versioning & Releases
+
+This repository does not have tagged releases yet.
+
+To keep release claims honest, the recommended policy is:
+- use **Semantic Versioning** tags (`vMAJOR.MINOR.PATCH`)
+- stay on **`v0.x` prereleases / early releases** until the script has stronger release confidence
+- use prerelease identifiers such as `v0.1.0-beta.1` or `v0.1.0-rc.1` for opt-in testing
+- treat any tag that contains `-` as a GitHub **prerelease**
+- attach source archives (`.tar.gz`, `.zip`) plus SHA256 sums to each tagged release
+
+Before tagging, update [CHANGELOG.md](CHANGELOG.md) and follow [docs/release-checklist.md](docs/release-checklist.md).
 
 ## Security & Privacy
 
