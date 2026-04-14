@@ -118,9 +118,17 @@ This script:
 - Logs are stored locally in your user directory
 - No network requests except package manager updates
 
-## Contributing
+## Community Health
 
-Feel free to submit issues and pull requests to improve this script.
+For a small utility repo, the goal is lightweight but clear collaboration:
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Support and FAQ](SUPPORT.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- issue forms and pull request template under `.github/`
+
+Please redact usernames, tokens, private paths, and other sensitive machine details before posting logs publicly.
 
 ## License
 
