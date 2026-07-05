@@ -7,12 +7,16 @@
 #        - (optional) brew bundle (install missing items from a Brewfile)
 #        - (optional) ensure specific casks are installed (and optionally "adopt" existing /Applications apps)
 #        - upgrade formulae
-#        - upgrade casks (--greedy)
+#        - upgrade casks (greedy mode configurable: latest|all|off)
 #        - cleanup
 #        - (optional) doctor
 #   2) npm globals: force @latest for all top-level global packages
-#   3) mas (Mac App Store): update all apps; if it fails, try mas reset and retry once
-#   4) (optional) Inventory /Applications and suggest matching brew casks for unmanaged apps
+#   3) App Store: check-only. Enumerates apps with a _MASReceipt and compares local
+#      versions against the iTunes Lookup API (mas-independent; 'mas upgrade' is
+#      unreliable on recent macOS). Optionally opens the App Store Updates page.
+#   4) (optional) Self-updaters: detect Sparkle/Squirrel apps, check their appcast
+#      feeds for newer versions, and report apps that must be opened to update.
+#   5) (optional) Inventory /Applications and suggest matching brew casks for unmanaged apps
 #
 # Design goals:
 # - Works on macOS default /bin/bash (bash 3.2).
@@ -43,12 +47,29 @@ RUN_INVENTORY=0
 RUN_SUGGEST_CASKS=0
 SUGGEST_LIMIT=30
 
+# Cask greedy mode: latest (--greedy-latest), all (--greedy), off (no flag).
+# Default 'latest': auto-updating casks (Chrome, etc.) update themselves and are
+# covered by the self-updater check instead of being reinstalled by brew.
+GREEDY_MODE="latest"
+RUN_SELF_UPDATERS=0
+OPEN_SELF_UPDATERS=0
+OPEN_APPSTORE=0
+ONLY_SECTIONS=""
+SKIP_SECTIONS=""
+JSON_OUTPUT=0
+NOTIFY=0
+
 STATUS_BREW="SKIPPED"
 STATUS_BREW_BUNDLE="SKIPPED"
 STATUS_BREW_DOCTOR="SKIPPED"
 STATUS_NPM="SKIPPED"
 STATUS_MAS="SKIPPED"
+STATUS_SELFUPDATE="SKIPPED"
 STATUS_INVENTORY="SKIPPED"
+
+MAS_OUTDATED_COUNT=0
+SELF_OUTDATED_COUNT=0
+SELF_UNKNOWN_COUNT=0
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
@@ -109,15 +130,25 @@ Core options:
   --quiet                   Minimal console output (still logs to file)
   --doctor                  Run 'brew doctor' (off by default)
   --fund                    Run 'npm fund' at the end of npm section (off by default)
+  --only CSV                Run only these sections (brew,npm,mas,selfupdate,inventory)
+  --skip CSV                Skip these sections (same names as --only)
+  --json                    Print a machine-readable JSON summary to stdout at the end
+  --notify                  Show a macOS notification with the summary when finished
 
 Homebrew coverage boosters:
   --bundle                  If a Brewfile is found (or provided), run 'brew bundle' to install missing items
   --brewfile PATH           Explicit Brewfile path (used with --bundle)
   --ensure-casks CSV        Ensure these casks are installed (comma-separated), e.g. "dropbox,github,whatsapp"
   --adopt-casks             When ensuring casks, use '--force' if needed to overwrite existing /Applications apps
+  --greedy-mode MODE        Cask greedy mode: latest (default; --greedy-latest), all (--greedy), off
+
+App Store / self-updaters:
+  --open-appstore           If outdated App Store apps are found, open the App Store Updates page
+  --check-self-updaters     Detect Sparkle/Squirrel self-updating apps and check their feeds for updates
+  --open-self-updaters      Open outdated self-updating apps so their built-in updaters can run (implies --check-self-updaters)
 
 Inventory / suggestions:
-  --inventory               List apps in /Applications and ~/Applications and classify (MAS / brew-cask / unmanaged)
+  --inventory               List apps in /Applications and ~/Applications and classify (MAS / brew-cask / self-updater / unmanaged)
   --suggest-casks           (Requires --inventory) For unmanaged apps, try 'brew search --cask' and suggest candidates
   --suggest-limit N         Max unmanaged apps to query for suggestions (default: $SUGGEST_LIMIT)
 
@@ -133,6 +164,8 @@ Examples:
   ./$SCRIPT_NAME --bundle --brewfile ~/.Brewfile
   ./$SCRIPT_NAME --ensure-casks "dropbox,github,whatsapp" --adopt-casks
   ./$SCRIPT_NAME --inventory --suggest-casks
+  ./$SCRIPT_NAME --check-self-updaters --open-appstore
+  ./$SCRIPT_NAME --only brew,npm
 EOF
 }
 
@@ -152,6 +185,21 @@ while [[ $# -gt 0 ]]; do
     --suggest-casks) RUN_SUGGEST_CASKS=1; shift ;;
     --suggest-limit) SUGGEST_LIMIT="${2:-30}"; shift 2 ;;
 
+    --only) ONLY_SECTIONS="${2:-}"; shift 2 ;;
+    --skip) SKIP_SECTIONS="${2:-}"; shift 2 ;;
+    --json) JSON_OUTPUT=1; shift ;;
+    --notify) NOTIFY=1; shift ;;
+    --greedy-mode)
+      GREEDY_MODE="${2:-}"
+      case "$GREEDY_MODE" in
+        all|latest|off) ;;
+        *) printf "Invalid --greedy-mode: '%s' (use: latest, all, off)\n" "$GREEDY_MODE"; exit 2 ;;
+      esac
+      shift 2 ;;
+    --open-appstore) OPEN_APPSTORE=1; shift ;;
+    --check-self-updaters) RUN_SELF_UPDATERS=1; shift ;;
+    --open-self-updaters) RUN_SELF_UPDATERS=1; OPEN_SELF_UPDATERS=1; shift ;;
+
     -h|--help) usage; exit 0 ;;
     *)
       hr
@@ -166,8 +214,91 @@ done
 hr
 log "$SCRIPT_NAME started at $START_TS"
 log "Log file: $LOG_FILE"
-log "Options: dry-run=$DRY_RUN quiet=$QUIET doctor=$RUN_BREW_DOCTOR fund=$RUN_NPM_FUND bundle=$RUN_BREW_BUNDLE ensure-casks='${ENSURE_CASKS_CSV}' adopt-casks=$ADOPT_CASKS inventory=$RUN_INVENTORY suggest-casks=$RUN_SUGGEST_CASKS"
+log "Options: dry-run=$DRY_RUN quiet=$QUIET doctor=$RUN_BREW_DOCTOR fund=$RUN_NPM_FUND bundle=$RUN_BREW_BUNDLE ensure-casks='${ENSURE_CASKS_CSV}' adopt-casks=$ADOPT_CASKS inventory=$RUN_INVENTORY suggest-casks=$RUN_SUGGEST_CASKS greedy-mode=$GREEDY_MODE self-updaters=$RUN_SELF_UPDATERS only='${ONLY_SECTIONS}' skip='${SKIP_SECTIONS}'"
 hr
+
+########################################
+# Lock file (prevent concurrent runs) + keep the Mac awake
+########################################
+LOCK_DIR="${TMPDIR:-/tmp}/update-all.lock"
+
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local old_pid
+    old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      log "Another $SCRIPT_NAME run (pid $old_pid) is in progress. Exiting."
+      exit 3
+    fi
+    log "Removing stale lock left by pid '${old_pid:-unknown}'."
+    rm -rf "$LOCK_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      log "Could not acquire lock at $LOCK_DIR. Exiting."
+      exit 3
+    fi
+  fi
+  printf "%s" "$$" > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+}
+
+acquire_lock
+
+# Prevent idle sleep while updates run; caffeinate exits when this script does.
+if have_cmd caffeinate && [[ "$DRY_RUN" -eq 0 ]]; then
+  caffeinate -i -w $$ &
+  log "caffeinate: preventing idle sleep for the duration of this run."
+fi
+
+########################################
+# Shared helpers: sections, versions, bundle metadata
+########################################
+section_enabled() {
+  # Usage: section_enabled <brew|npm|mas|selfupdate|inventory>
+  local name="$1"
+  local csv
+  if [[ -n "${ONLY_SECTIONS//[[:space:]]/}" ]]; then
+    csv=",${ONLY_SECTIONS// /},"
+    [[ "$csv" == *",${name},"* ]] || return 1
+  fi
+  if [[ -n "${SKIP_SECTIONS//[[:space:]]/}" ]]; then
+    csv=",${SKIP_SECTIONS// /},"
+    [[ "$csv" == *",${name},"* ]] && return 1
+  fi
+  return 0
+}
+
+ver_gt() {
+  # Returns 0 if version $1 is strictly greater than $2.
+  # Trailing .0 segments are insignificant (26 == 26.0).
+  local a="$1" b="$2"
+  while [[ "$a" == *.0 ]]; do a="${a%.0}"; done
+  while [[ "$b" == *.0 ]]; do b="${b%.0}"; done
+  [[ "$a" == "$b" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n 1)" == "$a" ]]
+}
+
+ver_comparable() {
+  # Both versions must start with a digit for sort -V to mean anything
+  # (guards against formats like 'Build 5898' vs '2025.9.2').
+  printf "%s" "$1" | grep -qE '^[0-9]' && printf "%s" "$2" | grep -qE '^[0-9]'
+}
+
+get_bundle_id() {
+  /usr/libexec/PlistBuddy -c "Print:CFBundleIdentifier" "$1/Contents/Info.plist" 2>/dev/null || true
+}
+
+appstore_country() {
+  # Two-letter storefront country from the system locale; fallback 'us'.
+  local locale region
+  locale="$(defaults read -g AppleLocale 2>/dev/null || true)"
+  region="${locale#*_}"
+  region="${region%%@*}"
+  if printf "%s" "$region" | grep -Eq '^[A-Za-z]{2}$'; then
+    printf "%s" "$region" | tr '[:upper:]' '[:lower:]'
+  else
+    printf "us"
+  fi
+}
 
 ########################################
 # Helpers: Brewfile discovery, brew outdated lists
@@ -196,13 +327,59 @@ brew_outdated_formulae() {
   brew outdated --formula 2>/dev/null || brew outdated --formulae 2>/dev/null || brew outdated 2>/dev/null || true
 }
 
+brew_greedy_args() {
+  # Echo the greedy flag for the configured mode (empty for 'off').
+  case "$GREEDY_MODE" in
+    all) printf -- "--greedy" ;;
+    latest) printf -- "--greedy-latest" ;;
+    *) printf "" ;;
+  esac
+}
+
 brew_outdated_casks() {
   # Best-effort across brew versions
-  brew outdated --cask --greedy 2>/dev/null \
-    || brew outdated --casks --greedy 2>/dev/null \
-    || brew outdated --cask 2>/dev/null \
-    || brew outdated --casks 2>/dev/null \
-    || true
+  case "$GREEDY_MODE" in
+    all)
+      brew outdated --cask --greedy 2>/dev/null \
+        || brew outdated --cask 2>/dev/null \
+        || true ;;
+    latest)
+      brew outdated --cask --greedy-latest 2>/dev/null \
+        || brew outdated --cask --greedy 2>/dev/null \
+        || brew outdated --cask 2>/dev/null \
+        || true ;;
+    *)
+      brew outdated --cask 2>/dev/null || true ;;
+  esac
+}
+
+warn_running_cask_apps() {
+  # Upgrading a cask while its app is running can leave the app broken until relaunch.
+  local list
+  list="$(brew_outdated_casks)"
+  [[ -z "${list//[[:space:]]/}" ]] && return 0
+
+  local prefix caskroom
+  prefix="$(brew_prefix)"
+  caskroom="$prefix/Caskroom"
+  [[ -d "$caskroom" ]] || return 0
+
+  local c cdir ver ap name
+  while IFS= read -r c; do
+    c="$(trim "${c%% *}")"
+    [[ -z "$c" ]] && continue
+    cdir="$caskroom/$c"
+    [[ -d "$cdir" ]] || continue
+    ver="$(ls -1t "$cdir" 2>/dev/null | head -n 1 || true)"
+    [[ -z "$ver" ]] && continue
+    while IFS= read -r ap; do
+      name="$(basename "$ap")"
+      name="${name%.app}"
+      if pgrep -qf "${name}.app/Contents/MacOS" 2>/dev/null; then
+        log "Homebrew: WARNING: '$name' (cask '$c') appears to be running; quit it before the upgrade to avoid a broken app until relaunch."
+      fi
+    done < <(find "$cdir/$ver" -maxdepth 3 -type d -name "*.app" 2>/dev/null)
+  done <<< "$list"
 }
 
 ########################################
@@ -309,10 +486,15 @@ brew_upgrade_casks_one_by_one() {
   local any_fail=0
   local c
 
+  local greedy_flag
+  greedy_flag="$(brew_greedy_args)"
+  local -a greedy_args=()
+  [[ -n "$greedy_flag" ]] && greedy_args=("$greedy_flag")
+
   local list
   list="$(brew_outdated_casks)"
   if [[ -z "${list//[[:space:]]/}" ]]; then
-    log "Homebrew: no outdated casks detected (including greedy)."
+    log "Homebrew: no outdated casks detected (greedy-mode: $GREEDY_MODE)."
     return 0
   fi
 
@@ -320,7 +502,7 @@ brew_upgrade_casks_one_by_one() {
   while IFS= read -r c; do
     c="$(trim "$c")"
     [[ -z "$c" ]] && continue
-    if run_cmd "Homebrew: brew upgrade --cask --greedy $c" brew upgrade --cask --greedy "$c"; then
+    if run_cmd "Homebrew: brew upgrade --cask ${greedy_flag} $c" brew upgrade --cask ${greedy_args[@]+"${greedy_args[@]}"} "$c"; then
       :
     else
       log "Homebrew: FAILED to upgrade cask '$c'"
@@ -362,7 +544,14 @@ update_brew() {
   fi
 
   # Upgrade casks (bulk; fallback one-by-one on failure)
-  if run_cmd "Homebrew: brew upgrade --cask --greedy (casks; bulk)" brew upgrade --cask --greedy; then
+  warn_running_cask_apps || true
+
+  local greedy_flag
+  greedy_flag="$(brew_greedy_args)"
+  local -a greedy_args=()
+  [[ -n "$greedy_flag" ]] && greedy_args=("$greedy_flag")
+
+  if run_cmd "Homebrew: brew upgrade --cask ${greedy_flag} (casks; bulk)" brew upgrade --cask ${greedy_args[@]+"${greedy_args[@]}"}; then
     any_success=1
   else
     log "Homebrew: bulk cask upgrade failed; falling back to one-by-one."
@@ -469,35 +658,230 @@ update_npm_globals() {
 }
 
 ########################################
-# 3) mas (Mac App Store)
+# 3) App Store (check-only; mas-independent)
 ########################################
-mas_has_subcommand() {
-  local sub="$1"
-  mas --help 2>/dev/null | grep -Eq "^[[:space:]]*${sub}[[:space:]]"
+list_mas_apps() {
+  # Newline-separated paths of apps with an App Store receipt.
+  local app
+  while IFS= read -r app; do
+    [[ -d "$app/Contents/_MASReceipt" ]] && printf "%s\n" "$app"
+  done < <(find /Applications "${HOME}/Applications" -maxdepth 1 -type d -name "*.app" 2>/dev/null | sort)
+}
+
+itunes_latest_version() {
+  # $1 = bundle id, $2 = storefront country. Prints latest version or nothing.
+  local json
+  json="$(curl -fsS --max-time 15 "https://itunes.apple.com/lookup?bundleId=${1}&country=${2}" 2>/dev/null || true)"
+  if [[ -z "$json" ]] || printf "%s" "$json" | grep -Eq '"resultCount" *: *0'; then
+    if [[ "$2" != "us" ]]; then
+      json="$(curl -fsS --max-time 15 "https://itunes.apple.com/lookup?bundleId=${1}&country=us" 2>/dev/null || true)"
+    fi
+  fi
+  printf "%s" "$json" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1
 }
 
 update_mas() {
-  if ! have_cmd mas; then
-    log "mas not found. (Install with: brew install mas). Skipping."
-    STATUS_MAS="MISSING"
+  # 'mas upgrade'/'mas outdated' are unreliable on recent macOS (Apple removed the
+  # private hooks mas relied on), so the primary check compares local receipts
+  # against the iTunes Lookup API. Check-only: installs still go through App Store.
+  hr
+  log "App Store: checking installed apps against the iTunes Lookup API"
+
+  local mas_apps
+  mas_apps="$(list_mas_apps)"
+  if [[ -z "${mas_apps//[[:space:]]/}" ]]; then
+    log "App Store: no apps with an App Store receipt found."
+    STATUS_MAS="OK"
     return 0
   fi
 
-  if mas_has_subcommand "account"; then
-    run_cmd "mas: account (diagnostic; requires App Store sign-in)" mas account || true
-  else
-    log "mas: 'account' subcommand not supported by this mas version; skipping diagnostic."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    local n
+    n="$(printf "%s\n" "$mas_apps" | grep -c . || true)"
+    log "App Store: DRY-RUN: would check $n apps via the iTunes Lookup API."
+    STATUS_MAS="OK"
+    return 0
   fi
 
-  run_cmd "mas: outdated (check for available updates)" mas outdated || true
+  local country
+  country="$(appstore_country)"
+  log "App Store: storefront country: $country"
 
-  # Skip actual updates - only checking for outdated apps
-  log "mas: skipping updates (check-only mode)"
-  STATUS_MAS="OK"
+  local app name bid local_ver remote_ver
+  local checked=0 outdated=0 notfound=0
+  while IFS= read -r app; do
+    [[ -z "$app" ]] && continue
+    name="$(basename "$app")"
+    name="${name%.app}"
+    bid="$(get_bundle_id "$app")"
+    local_ver="$(get_app_version "$app")"
+    [[ -z "$bid" ]] && continue
+
+    remote_ver="$(itunes_latest_version "$bid" "$country")"
+    checked=$((checked + 1))
+    if [[ -z "$remote_ver" ]]; then
+      log "App Store: ?          $name ($bid) local=$local_ver — not found in storefront (delisted or region-locked)"
+      notfound=$((notfound + 1))
+    elif ver_gt "$remote_ver" "$local_ver"; then
+      log "App Store: OUTDATED   $name local=$local_ver latest=$remote_ver"
+      outdated=$((outdated + 1))
+    else
+      log "App Store: up-to-date $name ($local_ver)"
+    fi
+    sleep 0.3  # be polite to the lookup API
+  done <<< "$mas_apps"
+
+  MAS_OUTDATED_COUNT="$outdated"
+  log "App Store: $checked checked, $outdated outdated, $notfound not found."
+
+  local auto_upd
+  auto_upd="$(defaults read com.apple.commerce AutoUpdate 2>/dev/null || true)"
+  if [[ "$auto_upd" != "1" ]]; then
+    log "App Store: automatic updates appear to be OFF (App Store > Settings > Automatic Updates)."
+  fi
+
+  if [[ "$outdated" -gt 0 ]]; then
+    if [[ "$OPEN_APPSTORE" -eq 1 ]]; then
+      run_cmd "App Store: opening the Updates page" open "macappstore://showUpdatesPage" || true
+    else
+      log "App Store: to install updates, rerun with --open-appstore or run: open 'macappstore://showUpdatesPage'"
+    fi
+  fi
+
+  # Cross-check with mas when present (informational only; do not install with it).
+  if have_cmd mas; then
+    run_cmd "mas: outdated (cross-check; may be unreliable on recent macOS)" mas outdated || true
+  fi
+
+  if [[ "$checked" -gt 0 && "$checked" -eq "$notfound" ]]; then
+    STATUS_MAS="WARN"
+  else
+    STATUS_MAS="OK"
+  fi
 }
 
 ########################################
-# 4) Inventory /Applications (optional)
+# 4) Self-updating apps (Sparkle/Squirrel; optional)
+########################################
+sparkle_feed_url() {
+  # $1 = app path, $2 = bundle id. Feed may be in Info.plist or set at runtime in defaults.
+  local feed
+  feed="$(/usr/libexec/PlistBuddy -c "Print:SUFeedURL" "$1/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ -z "${feed//[[:space:]]/}" && -n "$2" ]]; then
+    feed="$(defaults read "$2" SUFeedURL 2>/dev/null || true)"
+  fi
+  printf "%s" "$(trim "$feed")"
+}
+
+appcast_latest_version() {
+  # Fetch a Sparkle appcast and print the highest sparkle:shortVersionString
+  # (fallback: sparkle:version). Entries are not guaranteed newest-first.
+  local xml versions
+  xml="$(curl -fsSL --max-time 15 "$1" 2>/dev/null || true)"
+  [[ -z "$xml" ]] && return 0
+
+  versions="$(printf "%s" "$xml" \
+    | grep -oE 'sparkle:shortVersionString="[^"]+"|<sparkle:shortVersionString>[^<]+<' \
+    | sed -e 's/sparkle:shortVersionString="//' -e 's/"$//' -e 's/<sparkle:shortVersionString>//' -e 's/<$//' \
+    || true)"
+  if [[ -z "${versions//[[:space:]]/}" ]]; then
+    versions="$(printf "%s" "$xml" \
+      | grep -oE 'sparkle:version="[^"]+"|<sparkle:version>[^<]+<' \
+      | sed -e 's/sparkle:version="//' -e 's/"$//' -e 's/<sparkle:version>//' -e 's/<$//' \
+      || true)"
+  fi
+  [[ -z "${versions//[[:space:]]/}" ]] && return 0
+
+  # Prefer stable-looking versions: drop prerelease markers and entries with
+  # whitespace, unless that would leave nothing.
+  local stable
+  stable="$(printf "%s\n" "$versions" \
+    | grep -ivE 'beta|alpha|daily|nightly|preview|-rc' \
+    | grep -vE '[[:space:]]' \
+    || true)"
+  [[ -n "${stable//[[:space:]]/}" ]] && versions="$stable"
+
+  printf "%s\n" "$versions" | sort -V | tail -n 1
+}
+
+check_self_updaters() {
+  if [[ "$RUN_SELF_UPDATERS" -ne 1 ]]; then
+    STATUS_SELFUPDATE="SKIPPED"
+    return 0
+  fi
+
+  hr
+  log "Self-updaters: scanning /Applications and ~/Applications for Sparkle/Squirrel apps"
+
+  local app name bid local_ver feed remote_ver kind
+  local checked=0 outdated=0 unknown=0
+  local outdated_apps=""
+
+  while IFS= read -r app; do
+    kind=""
+    [[ -d "$app/Contents/Frameworks/Sparkle.framework" ]] && kind="sparkle"
+    [[ -z "$kind" && -d "$app/Contents/Frameworks/Squirrel.framework" ]] && kind="squirrel"
+    [[ -z "$kind" ]] && continue
+    # MAS builds update through the App Store, not their bundled updater.
+    [[ -d "$app/Contents/_MASReceipt" ]] && continue
+
+    name="$(basename "$app")"
+    name="${name%.app}"
+    bid="$(get_bundle_id "$app")"
+    local_ver="$(get_app_version "$app")"
+    [[ -z "$local_ver" ]] && local_ver="?"
+
+    if [[ "$kind" == "squirrel" ]]; then
+      log "Self-updaters: UNKNOWN    $name ($local_ver) — Squirrel/Electron updater; open the app to update."
+      unknown=$((unknown + 1))
+      continue
+    fi
+
+    feed="$(sparkle_feed_url "$app" "$bid")"
+    if [[ -z "$feed" ]]; then
+      log "Self-updaters: UNKNOWN    $name ($local_ver) — no discoverable Sparkle feed; open the app to update."
+      unknown=$((unknown + 1))
+      continue
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "Self-updaters: DRY-RUN: would check '$name' against feed: $feed"
+      continue
+    fi
+
+    remote_ver="$(appcast_latest_version "$feed")"
+    checked=$((checked + 1))
+    if [[ -z "$remote_ver" ]]; then
+      log "Self-updaters: ?          $name ($local_ver) — could not read appcast: $feed"
+      unknown=$((unknown + 1))
+    elif ! ver_comparable "$remote_ver" "$local_ver"; then
+      log "Self-updaters: ?          $name local=$local_ver feed=$remote_ver — version formats not comparable; open the app to check."
+      unknown=$((unknown + 1))
+    elif ver_gt "$remote_ver" "$local_ver"; then
+      log "Self-updaters: OUTDATED   $name local=$local_ver latest=$remote_ver — open the app to update."
+      outdated=$((outdated + 1))
+      outdated_apps="${outdated_apps}${app}"$'\n'
+    else
+      log "Self-updaters: up-to-date $name ($local_ver)"
+    fi
+  done < <(find /Applications "${HOME}/Applications" -maxdepth 1 -type d -name "*.app" 2>/dev/null | sort)
+
+  SELF_OUTDATED_COUNT="$outdated"
+  SELF_UNKNOWN_COUNT="$unknown"
+  log "Self-updaters: $checked checked, $outdated outdated, $unknown need the app opened to check/update."
+
+  if [[ "$OPEN_SELF_UPDATERS" -eq 1 && "$DRY_RUN" -eq 0 && -n "${outdated_apps//[[:space:]]/}" ]]; then
+    while IFS= read -r app; do
+      [[ -z "$app" ]] && continue
+      run_cmd "Self-updaters: opening $(basename "$app") so its updater can run" open "$app" || true
+    done <<< "$outdated_apps"
+  fi
+
+  STATUS_SELFUPDATE="OK"
+}
+
+########################################
+# 5) Inventory /Applications (optional)
 ########################################
 get_app_version() {
   # Best effort: CFBundleShortVersionString or CFBundleVersion
@@ -585,9 +969,8 @@ inventory_apps() {
   for d in "${dirs[@]}"; do
     [[ -d "$d" ]] || continue
 
-    # Only top-level .app bundles
-    find "$d" -maxdepth 1 -type d -name "*.app" -print0 2>/dev/null \
-      | while IFS= read -r -d '' app; do
+    # Only top-level .app bundles (process substitution keeps counters in this shell)
+    while IFS= read -r -d '' app; do
           local name
           name="$(basename "$app")"
           name="${name%.app}"
@@ -597,6 +980,8 @@ inventory_apps() {
             src="MAS"
           elif [[ -n "$brew_appnames" ]] && printf "%s\n" "$brew_appnames" | grep -Fxq "$name"; then
             src="BREW-CASK"
+          elif [[ -d "$app/Contents/Frameworks/Sparkle.framework" || -d "$app/Contents/Frameworks/Squirrel.framework" ]]; then
+            src="SELF-UPDATER"
           fi
 
           local ver
@@ -627,19 +1012,21 @@ inventory_apps() {
               fi
             fi
           fi
-        done
+        done < <(find "$d" -maxdepth 1 -type d -name "*.app" -print0 2>/dev/null)
   done
 
+  log "Inventory: $unmanaged_count unmanaged app(s) found."
   STATUS_INVENTORY="OK"
 }
 
 ########################################
 # Run all sections
 ########################################
-update_brew
-update_npm_globals
-update_mas
-inventory_apps
+if section_enabled brew; then update_brew; fi
+if section_enabled npm; then update_npm_globals; fi
+if section_enabled mas; then update_mas; fi
+if section_enabled selfupdate; then check_self_updaters; fi
+if section_enabled inventory; then inventory_apps; fi
 
 ########################################
 # Summary + exit code
@@ -652,11 +1039,22 @@ log "  Homebrew:        $STATUS_BREW"
 log "  brew bundle:     $STATUS_BREW_BUNDLE"
 log "  brew doctor:     $STATUS_BREW_DOCTOR"
 log "  npm globals:     $STATUS_NPM"
-log "  mas (App Store): $STATUS_MAS"
+log "  App Store:       $STATUS_MAS (outdated: $MAS_OUTDATED_COUNT)"
+log "  self-updaters:   $STATUS_SELFUPDATE (outdated: $SELF_OUTDATED_COUNT, open-to-update: $SELF_UNKNOWN_COUNT)"
 log "  inventory:       $STATUS_INVENTORY"
 hr
 log "Full log: $LOG_FILE"
 hr
+
+if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+  printf '{"brew":"%s","brew_bundle":"%s","brew_doctor":"%s","npm":"%s","app_store":"%s","self_updaters":"%s","inventory":"%s","app_store_outdated":%d,"self_updaters_outdated":%d,"self_updaters_open_to_update":%d,"log_file":"%s"}\n' \
+    "$STATUS_BREW" "$STATUS_BREW_BUNDLE" "$STATUS_BREW_DOCTOR" "$STATUS_NPM" "$STATUS_MAS" "$STATUS_SELFUPDATE" "$STATUS_INVENTORY" \
+    "$MAS_OUTDATED_COUNT" "$SELF_OUTDATED_COUNT" "$SELF_UNKNOWN_COUNT" "$LOG_FILE"
+fi
+
+if [[ "$NOTIFY" -eq 1 ]] && have_cmd osascript; then
+  osascript -e "display notification \"brew: $STATUS_BREW, npm: $STATUS_NPM, App Store outdated: $MAS_OUTDATED_COUNT, self-updaters outdated: $SELF_OUTDATED_COUNT\" with title \"update-all finished\"" >/dev/null 2>&1 || true
+fi
 
 EXIT_CODE=0
 for st in "$STATUS_BREW" "$STATUS_NPM" "$STATUS_MAS"; do
