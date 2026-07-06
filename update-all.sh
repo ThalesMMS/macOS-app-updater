@@ -43,6 +43,7 @@ RUN_BREW_BUNDLE=0
 BREWFILE_PATH=""
 ENSURE_CASKS_CSV=""
 ADOPT_CASKS=0
+REPAIR_CASK_DRIFT=0
 RUN_INVENTORY=0
 RUN_SUGGEST_CASKS=0
 SUGGEST_LIMIT=30
@@ -68,8 +69,12 @@ STATUS_SELFUPDATE="SKIPPED"
 STATUS_INVENTORY="SKIPPED"
 
 MAS_OUTDATED_COUNT=0
+APPSTORE_STALE_LOOKUP_COUNT=0
 SELF_OUTDATED_COUNT=0
 SELF_UNKNOWN_COUNT=0
+CASK_DRIFT_DETECTED=0
+CASK_DRIFT_REPAIRED=0
+CASK_DRIFT_FAILED=0
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
@@ -140,6 +145,7 @@ Homebrew coverage boosters:
   --brewfile PATH           Explicit Brewfile path (used with --bundle)
   --ensure-casks CSV        Ensure these casks are installed (comma-separated), e.g. "dropbox,github,whatsapp"
   --adopt-casks             When ensuring casks, use '--force' if needed to overwrite existing /Applications apps
+  --repair-cask-drift       Reinstall installed casks when Homebrew's version is newer than the actual .app bundle
   --greedy-mode MODE        Cask greedy mode: latest (default; --greedy-latest), all (--greedy), off
 
 App Store / self-updaters:
@@ -180,6 +186,7 @@ while [[ $# -gt 0 ]]; do
     --brewfile) BREWFILE_PATH="${2:-}"; shift 2 ;;
     --ensure-casks) ENSURE_CASKS_CSV="${2:-}"; shift 2 ;;
     --adopt-casks) ADOPT_CASKS=1; shift ;;
+    --repair-cask-drift) REPAIR_CASK_DRIFT=1; shift ;;
 
     --inventory) RUN_INVENTORY=1; shift ;;
     --suggest-casks) RUN_SUGGEST_CASKS=1; shift ;;
@@ -214,7 +221,7 @@ done
 hr
 log "$SCRIPT_NAME started at $START_TS"
 log "Log file: $LOG_FILE"
-log "Options: dry-run=$DRY_RUN quiet=$QUIET doctor=$RUN_BREW_DOCTOR fund=$RUN_NPM_FUND bundle=$RUN_BREW_BUNDLE ensure-casks='${ENSURE_CASKS_CSV}' adopt-casks=$ADOPT_CASKS inventory=$RUN_INVENTORY suggest-casks=$RUN_SUGGEST_CASKS greedy-mode=$GREEDY_MODE self-updaters=$RUN_SELF_UPDATERS only='${ONLY_SECTIONS}' skip='${SKIP_SECTIONS}'"
+log "Options: dry-run=$DRY_RUN quiet=$QUIET doctor=$RUN_BREW_DOCTOR fund=$RUN_NPM_FUND bundle=$RUN_BREW_BUNDLE ensure-casks='${ENSURE_CASKS_CSV}' adopt-casks=$ADOPT_CASKS repair-cask-drift=$REPAIR_CASK_DRIFT inventory=$RUN_INVENTORY suggest-casks=$RUN_SUGGEST_CASKS greedy-mode=$GREEDY_MODE self-updaters=$RUN_SELF_UPDATERS only='${ONLY_SECTIONS}' skip='${SKIP_SECTIONS}'"
 hr
 
 ########################################
@@ -380,6 +387,292 @@ warn_running_cask_apps() {
       fi
     done < <(find "$cdir/$ver" -maxdepth 3 -type d -name "*.app" 2>/dev/null)
   done <<< "$list"
+}
+
+cask_receipt_path() {
+  local cask="$1"
+  local prefix
+  prefix="$(brew_prefix)"
+  [[ -z "${prefix//[[:space:]]/}" ]] && return 0
+  printf "%s/Caskroom/%s/.metadata/INSTALL_RECEIPT.json" "$prefix" "$cask"
+}
+
+plist_raw() {
+  # Usage: plist_raw key.path file
+  plutil -extract "$1" raw -o - "$2" 2>/dev/null || true
+}
+
+cask_receipt_version() {
+  local receipt="$1"
+  [[ -f "$receipt" ]] || return 0
+  plist_raw "source.version" "$receipt"
+}
+
+cask_receipt_app_names() {
+  local receipt="$1"
+  local count i app_count j app_name
+
+  [[ -f "$receipt" ]] || return 0
+  count="$(plist_raw "uninstall_artifacts" "$receipt")"
+  case "$count" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+
+  i=0
+  while [[ "$i" -lt "$count" ]]; do
+    if [[ "$(plutil -type "uninstall_artifacts.$i.app" "$receipt" 2>/dev/null || true)" == "array" ]]; then
+      app_count="$(plist_raw "uninstall_artifacts.$i.app" "$receipt")"
+      case "$app_count" in
+        ""|*[!0-9]*) app_count=0 ;;
+      esac
+      j=0
+      while [[ "$j" -lt "$app_count" ]]; do
+        app_name="$(plist_raw "uninstall_artifacts.$i.app.$j" "$receipt")"
+        [[ "$app_name" == *.app ]] && printf "%s\n" "$app_name"
+        j=$((j + 1))
+      done
+    fi
+    i=$((i + 1))
+  done
+}
+
+cask_app_target() {
+  local cask="$1" cask_ver="$2" app_name="$3"
+  local prefix caskroom candidate target
+
+  prefix="$(brew_prefix)"
+  caskroom="$prefix/Caskroom"
+  candidate="$caskroom/$cask/$cask_ver/$app_name"
+
+  if [[ -L "$candidate" ]]; then
+    target="$(readlink "$candidate" 2>/dev/null || true)"
+    if [[ "$target" == /* && -d "$target" ]]; then
+      printf "%s" "$target"
+      return 0
+    fi
+  fi
+
+  if [[ -d "/Applications/$app_name" ]]; then
+    printf "%s" "/Applications/$app_name"
+  elif [[ -d "${HOME}/Applications/$app_name" ]]; then
+    printf "%s" "${HOME}/Applications/$app_name"
+  elif [[ -d "$candidate" ]]; then
+    printf "%s" "$candidate"
+  fi
+}
+
+ver_drift_comparable() {
+  local a="$1" b="$2" a_parts=1 b_parts=1 rest
+  printf "%s" "$1" | grep -qE '^[0-9][0-9A-Za-z._+-]*$' \
+    && printf "%s" "$2" | grep -qE '^[0-9][0-9A-Za-z._+-]*$' \
+    || return 1
+
+  rest="$a"
+  while [[ "$rest" == *.* ]]; do
+    a_parts=$((a_parts + 1))
+    rest="${rest#*.}"
+  done
+
+  rest="$b"
+  while [[ "$rest" == *.* ]]; do
+    b_parts=$((b_parts + 1))
+    rest="${rest#*.}"
+  done
+
+  [[ "$a_parts" -eq "$b_parts" ]]
+}
+
+cask_has_version_drift() {
+  local cask="$1"
+  local receipt cask_ver app_names app_name app_path local_ver found
+
+  receipt="$(cask_receipt_path "$cask")"
+  cask_ver="$(cask_receipt_version "$receipt")"
+  [[ -z "${cask_ver//[[:space:]]/}" ]] && return 1
+
+  app_names="$(cask_receipt_app_names "$receipt")"
+  [[ -z "${app_names//[[:space:]]/}" ]] && return 1
+
+  found=0
+  while IFS= read -r app_name; do
+    [[ -z "$app_name" ]] && continue
+    app_path="$(cask_app_target "$cask" "$cask_ver" "$app_name")"
+    [[ -z "$app_path" || ! -d "$app_path" ]] && continue
+
+    local_ver="$(get_app_version "$app_path")"
+    [[ -z "${local_ver//[[:space:]]/}" ]] && continue
+    ver_drift_comparable "$cask_ver" "$local_ver" || continue
+
+    if ver_gt "$cask_ver" "$local_ver"; then
+      log "Homebrew: CASK-DRIFT $cask app=$app_name cask=$cask_ver bundle=$local_ver path=$app_path"
+      found=1
+    fi
+  done <<< "$app_names"
+
+  [[ "$found" -eq 1 ]]
+}
+
+cask_has_running_app() {
+  local cask="$1"
+  local receipt cask_ver app_names app_name app_path app_base running
+
+  receipt="$(cask_receipt_path "$cask")"
+  cask_ver="$(cask_receipt_version "$receipt")"
+  app_names="$(cask_receipt_app_names "$receipt")"
+  running=1
+
+  while IFS= read -r app_name; do
+    [[ -z "$app_name" ]] && continue
+    app_path="$(cask_app_target "$cask" "$cask_ver" "$app_name")"
+    [[ -z "$app_path" ]] && continue
+    app_base="$(basename "$app_path")"
+    if pgrep -qf "${app_base}/Contents/MacOS" 2>/dev/null; then
+      log "Homebrew: CASK-DRIFT repair skipped for '$cask' because '$app_base' appears to be running."
+      running=0
+    fi
+  done <<< "$app_names"
+
+  return "$running"
+}
+
+restore_staged_cask_apps() {
+  local staged="$1"
+  local backup original
+
+  while IFS='|' read -r backup original; do
+    [[ -z "$backup" || -z "$original" ]] && continue
+    if [[ -d "$backup" && ! -e "$original" ]]; then
+      if mv "$backup" "$original" 2>/dev/null; then
+        log "Homebrew: restored staged app '$original' after failed repair."
+      else
+        log "Homebrew: WARNING: could not restore staged app '$backup' to '$original'."
+      fi
+    elif [[ -d "$backup" ]]; then
+      log "Homebrew: staged app remains at '$backup'."
+    fi
+  done <<< "$staged"
+}
+
+stage_unwritable_cask_apps() {
+  local cask="$1"
+  local receipt cask_ver app_names app_name app_path app_parent trash backup n staged
+
+  receipt="$(cask_receipt_path "$cask")"
+  cask_ver="$(cask_receipt_version "$receipt")"
+  app_names="$(cask_receipt_app_names "$receipt")"
+  staged=""
+
+  while IFS= read -r app_name; do
+    [[ -z "$app_name" ]] && continue
+    app_path="$(cask_app_target "$cask" "$cask_ver" "$app_name")"
+    [[ -z "$app_path" || ! -d "$app_path" ]] && continue
+    if [[ ! -w "$app_path" ]]; then
+      app_parent="$(dirname "$app_path")"
+      if [[ ! -w "$app_parent" ]]; then
+        log "Homebrew: CASK-DRIFT repair skipped for '$cask' because '$app_path' is not movable without sudo."
+        restore_staged_cask_apps "$staged"
+        return 1
+      fi
+
+      trash="${HOME}/.Trash"
+      if ! mkdir -p "$trash" 2>/dev/null; then
+        log "Homebrew: CASK-DRIFT repair skipped for '$cask' because '$trash' could not be created."
+        restore_staged_cask_apps "$staged"
+        return 1
+      fi
+
+      backup="$trash/${app_name}.update-all-backup-${START_TS}"
+      n=1
+      while [[ -e "$backup" ]]; do
+        backup="$trash/${app_name}.update-all-backup-${START_TS}.$n"
+        n=$((n + 1))
+      done
+
+      if mv "$app_path" "$backup" 2>/dev/null; then
+        log "Homebrew: staged unwritable app '$app_path' at '$backup' before repair."
+        staged="${staged}${backup}|${app_path}"$'\n'
+      else
+        log "Homebrew: CASK-DRIFT repair skipped for '$cask' because '$app_path' could not be moved without sudo."
+        restore_staged_cask_apps "$staged"
+        return 1
+      fi
+    fi
+  done <<< "$app_names"
+
+  STAGED_CASK_APP_BACKUPS="$staged"
+  return 0
+}
+
+check_cask_drift() {
+  if ! have_cmd plutil; then
+    log "Homebrew: plutil not found; skipping cask drift check."
+    return 0
+  fi
+
+  local casks cask any_unrepaired=0
+  casks="$(brew list --cask 2>/dev/null || true)"
+  if [[ -z "${casks//[[:space:]]/}" ]]; then
+    log "Homebrew: no installed casks found for drift check."
+    return 0
+  fi
+
+  hr
+  log "Homebrew: checking installed cask app versions for drift"
+
+  while IFS= read -r cask; do
+    cask="$(trim "$cask")"
+    [[ -z "$cask" ]] && continue
+
+    if cask_has_version_drift "$cask"; then
+      CASK_DRIFT_DETECTED=$((CASK_DRIFT_DETECTED + 1))
+
+      if [[ "$REPAIR_CASK_DRIFT" -ne 1 ]]; then
+        log "Homebrew: CASK-DRIFT repair available for '$cask'; rerun with --repair-cask-drift to reinstall this cask."
+        any_unrepaired=1
+        continue
+      fi
+
+      if cask_has_running_app "$cask"; then
+        CASK_DRIFT_FAILED=$((CASK_DRIFT_FAILED + 1))
+        any_unrepaired=1
+        continue
+      fi
+
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "Homebrew: DRY-RUN: would repair cask drift with: brew reinstall --cask --force --no-ask $cask"
+        any_unrepaired=1
+        continue
+      fi
+
+      STAGED_CASK_APP_BACKUPS=""
+      if ! stage_unwritable_cask_apps "$cask"; then
+        CASK_DRIFT_FAILED=$((CASK_DRIFT_FAILED + 1))
+        any_unrepaired=1
+        continue
+      fi
+
+      if run_cmd "Homebrew: repair cask drift for '$cask'" brew reinstall --cask --force --no-ask "$cask"; then
+        if cask_has_version_drift "$cask"; then
+          log "Homebrew: CASK-DRIFT repair did not resolve '$cask'."
+          restore_staged_cask_apps "$STAGED_CASK_APP_BACKUPS"
+          CASK_DRIFT_FAILED=$((CASK_DRIFT_FAILED + 1))
+          any_unrepaired=1
+        else
+          log "Homebrew: CASK-DRIFT repaired '$cask'."
+          restore_staged_cask_apps "$STAGED_CASK_APP_BACKUPS"
+          CASK_DRIFT_REPAIRED=$((CASK_DRIFT_REPAIRED + 1))
+        fi
+      else
+        log "Homebrew: CASK-DRIFT repair failed for '$cask'."
+        restore_staged_cask_apps "$STAGED_CASK_APP_BACKUPS"
+        CASK_DRIFT_FAILED=$((CASK_DRIFT_FAILED + 1))
+        any_unrepaired=1
+      fi
+    fi
+  done <<< "$casks"
+
+  log "Homebrew: cask drift detected=$CASK_DRIFT_DETECTED repaired=$CASK_DRIFT_REPAIRED failed=$CASK_DRIFT_FAILED"
+  return "$any_unrepaired"
 }
 
 ########################################
@@ -562,6 +855,12 @@ update_brew() {
     fi
   fi
 
+  if check_cask_drift; then
+    :
+  else
+    any_fail=1
+  fi
+
   run_cmd "Homebrew: brew cleanup" brew cleanup || true
 
   if [[ "$RUN_BREW_DOCTOR" -eq 1 ]]; then
@@ -708,7 +1007,7 @@ update_mas() {
   log "App Store: storefront country: $country"
 
   local app name bid local_ver remote_ver
-  local checked=0 outdated=0 notfound=0
+  local checked=0 outdated=0 notfound=0 stale_lookup=0
   while IFS= read -r app; do
     [[ -z "$app" ]] && continue
     name="$(basename "$app")"
@@ -725,6 +1024,9 @@ update_mas() {
     elif ver_gt "$remote_ver" "$local_ver"; then
       log "App Store: OUTDATED   $name local=$local_ver latest=$remote_ver"
       outdated=$((outdated + 1))
+    elif ver_comparable "$local_ver" "$remote_ver" && ver_gt "$local_ver" "$remote_ver"; then
+      log "App Store: STALE-LOOKUP $name local=$local_ver lookup=$remote_ver — iTunes Lookup is behind the installed version"
+      stale_lookup=$((stale_lookup + 1))
     else
       log "App Store: up-to-date $name ($local_ver)"
     fi
@@ -732,7 +1034,8 @@ update_mas() {
   done <<< "$mas_apps"
 
   MAS_OUTDATED_COUNT="$outdated"
-  log "App Store: $checked checked, $outdated outdated, $notfound not found."
+  APPSTORE_STALE_LOOKUP_COUNT="$stale_lookup"
+  log "App Store: $checked checked, $outdated outdated, $notfound not found, $stale_lookup stale lookup."
 
   local auto_upd
   auto_upd="$(defaults read com.apple.commerce AutoUpdate 2>/dev/null || true)"
@@ -754,6 +1057,8 @@ update_mas() {
   fi
 
   if [[ "$checked" -gt 0 && "$checked" -eq "$notfound" ]]; then
+    STATUS_MAS="WARN"
+  elif [[ "$stale_lookup" -gt 0 ]]; then
     STATUS_MAS="WARN"
   else
     STATUS_MAS="OK"
@@ -1039,21 +1344,23 @@ log "  Homebrew:        $STATUS_BREW"
 log "  brew bundle:     $STATUS_BREW_BUNDLE"
 log "  brew doctor:     $STATUS_BREW_DOCTOR"
 log "  npm globals:     $STATUS_NPM"
-log "  App Store:       $STATUS_MAS (outdated: $MAS_OUTDATED_COUNT)"
+log "  App Store:       $STATUS_MAS (outdated: $MAS_OUTDATED_COUNT, stale lookup: $APPSTORE_STALE_LOOKUP_COUNT)"
 log "  self-updaters:   $STATUS_SELFUPDATE (outdated: $SELF_OUTDATED_COUNT, open-to-update: $SELF_UNKNOWN_COUNT)"
+log "  cask drift:      detected=$CASK_DRIFT_DETECTED repaired=$CASK_DRIFT_REPAIRED failed=$CASK_DRIFT_FAILED"
 log "  inventory:       $STATUS_INVENTORY"
 hr
 log "Full log: $LOG_FILE"
 hr
 
 if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-  printf '{"brew":"%s","brew_bundle":"%s","brew_doctor":"%s","npm":"%s","app_store":"%s","self_updaters":"%s","inventory":"%s","app_store_outdated":%d,"self_updaters_outdated":%d,"self_updaters_open_to_update":%d,"log_file":"%s"}\n' \
+  printf '{"brew":"%s","brew_bundle":"%s","brew_doctor":"%s","npm":"%s","app_store":"%s","self_updaters":"%s","inventory":"%s","app_store_outdated":%d,"app_store_stale_lookup":%d,"self_updaters_outdated":%d,"self_updaters_open_to_update":%d,"cask_drift_detected":%d,"cask_drift_repaired":%d,"cask_drift_failed":%d,"log_file":"%s"}\n' \
     "$STATUS_BREW" "$STATUS_BREW_BUNDLE" "$STATUS_BREW_DOCTOR" "$STATUS_NPM" "$STATUS_MAS" "$STATUS_SELFUPDATE" "$STATUS_INVENTORY" \
-    "$MAS_OUTDATED_COUNT" "$SELF_OUTDATED_COUNT" "$SELF_UNKNOWN_COUNT" "$LOG_FILE"
+    "$MAS_OUTDATED_COUNT" "$APPSTORE_STALE_LOOKUP_COUNT" "$SELF_OUTDATED_COUNT" "$SELF_UNKNOWN_COUNT" \
+    "$CASK_DRIFT_DETECTED" "$CASK_DRIFT_REPAIRED" "$CASK_DRIFT_FAILED" "$LOG_FILE"
 fi
 
 if [[ "$NOTIFY" -eq 1 ]] && have_cmd osascript; then
-  osascript -e "display notification \"brew: $STATUS_BREW, npm: $STATUS_NPM, App Store outdated: $MAS_OUTDATED_COUNT, self-updaters outdated: $SELF_OUTDATED_COUNT\" with title \"update-all finished\"" >/dev/null 2>&1 || true
+  osascript -e "display notification \"brew: $STATUS_BREW, npm: $STATUS_NPM, App Store outdated: $MAS_OUTDATED_COUNT, cask drift: $CASK_DRIFT_DETECTED\" with title \"update-all finished\"" >/dev/null 2>&1 || true
 fi
 
 EXIT_CODE=0

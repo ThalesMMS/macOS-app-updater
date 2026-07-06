@@ -24,6 +24,7 @@ A comprehensive bash script to update all your macOS applications and packages i
 - ✅ Brewfile support for reproducible package management
 - ✅ Application inventory with cask suggestions
 - ✅ Ensure specific casks are installed
+- ✅ Detects Homebrew cask drift where the cask version is newer than the installed `.app` bundle, with opt-in repair
 - ✅ App Store update detection without `mas` (iTunes Lookup API)
 - ✅ Sparkle/Squirrel self-updater detection with appcast version checks
 - ✅ Section filters (`--only` / `--skip`), JSON summary, macOS notifications
@@ -72,6 +73,9 @@ chmod +x update-all.sh
 # Ensure specific casks are installed
 ./update-all.sh --ensure-casks "dropbox,github,whatsapp" --adopt-casks
 
+# Repair casks whose Homebrew receipt is newer than the app in /Applications
+./update-all.sh --only brew --repair-cask-drift
+
 # Inventory applications and suggest casks
 ./update-all.sh --inventory --suggest-casks
 
@@ -103,6 +107,7 @@ chmod +x update-all.sh
 - `--brewfile PATH`: Explicit Brewfile path (used with --bundle)
 - `--ensure-casks CSV`: Ensure these casks are installed (comma-separated)
 - `--adopt-casks`: When ensuring casks, use `--force` if needed to overwrite existing apps
+- `--repair-cask-drift`: Reinstall installed casks when Homebrew's recorded cask version is newer than the actual `.app` bundle version. Without this option, drift is reported as a warning only. Apps that are running are skipped; unwritable apps are moved to `~/.Trash` first when they can be moved without `sudo`.
 - `--greedy-mode MODE`: Cask greedy mode — `latest` (default, `--greedy-latest`), `all` (`--greedy`), or `off`. The default no longer reinstalls auto-updating casks; those are covered by the self-updater check instead.
 
 ### App Store / Self-Updater Options
@@ -110,7 +115,9 @@ chmod +x update-all.sh
 - `--check-self-updaters`: Detect Sparkle/Squirrel self-updating apps and check their appcast feeds for newer versions
 - `--open-self-updaters`: Open outdated self-updating apps so their built-in updaters can run (implies `--check-self-updaters`)
 
-The App Store check is `mas`-independent: it enumerates apps with an App Store receipt and compares local versions against the iTunes Lookup API. It is check-only — `mas upgrade` is unreliable on recent macOS, so installs still go through the App Store app (use `--open-appstore` to jump straight to the Updates page).
+The App Store check is `mas`-independent: it enumerates apps with an App Store receipt and compares local versions against the iTunes Lookup API. It is check-only — `mas upgrade` is unreliable on recent macOS, so installs still go through the App Store app (use `--open-appstore` to jump straight to the Updates page). If Apple's lookup result is older than the installed app, the script reports a stale lookup instead of calling the app up to date.
+
+The JSON summary includes `cask_drift_detected`, `cask_drift_repaired`, `cask_drift_failed`, and `app_store_stale_lookup` counters.
 
 ### Inventory Options
 - `--inventory`: List apps in /Applications and ~/Applications and classify (MAS / brew-cask / self-updater / unmanaged)
